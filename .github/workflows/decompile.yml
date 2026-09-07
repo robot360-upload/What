@@ -1,0 +1,117 @@
+name: Decompile ELF
+
+on:
+  workflow_dispatch:
+
+jobs:
+  decompile:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download Ghidra
+        run: |
+          wget -q https://github.com/NationalSecurityAgency/ghidra/releases/download/Ghidra_12.0_build/ghidra_12.0_PUBLIC_20260306.zip
+          unzip -q ghidra_12.0_PUBLIC_20260306.zip
+          GHIDRA_DIR=$(find . -maxdepth 1 -type d -name 'ghidra_*' | head -1)
+          echo "GHIDRA_DIR=$GHIDRA_DIR" >> "$GITHUB_ENV"
+
+      - name: Check ELF
+        run: |
+          file library.so
+          readelf -h library.so
+
+      - name: Create Ghidra project
+        run: |
+          mkdir -p ghidra-project
+          mkdir -p output
+
+          "$GHIDRA_DIR/support/analyzeHeadless" \
+            "$(pwd)/ghidra-project" \
+            ELFProject \
+            -import "$(pwd)/library.so" \
+            -analysisTimeoutPerFile 600 \
+            -deleteProject
+
+      - name: Export C pseudocode
+        run: |
+          cat > ExportC.java <<'EOF'
+          import ghidra.app.decompiler.*;
+          import ghidra.program.model.listing.*;
+          import ghidra.util.task.*;
+          import ghidra.app.script.GhidraScript;
+
+          public class ExportC extends GhidraScript {
+              @Override
+              public void run() throws Exception {
+                  DecompInterface decompiler = new DecompInterface();
+
+                  decompiler.openProgram(currentProgram);
+
+                  FunctionIterator functions =
+                      currentProgram.getFunctionManager().getFunctions(true);
+
+                  java.io.File out =
+                      new java.io.File(getScriptArgs()[0]);
+
+                  java.io.PrintWriter writer =
+                      new java.io.PrintWriter(out);
+
+                  while (functions.hasNext() && !monitor.isCancelled()) {
+                      Function function = functions.next();
+
+                      DecompileResults result =
+                          decompiler.decompileFunction(
+                              function,
+                              60,
+                              monitor
+                          );
+
+                      writer.println(
+                          "/* ======================================== */"
+                      );
+
+                      writer.println(
+                          "/* " + function.getName() + " */"
+                      );
+
+                      writer.println(
+                          "/* ======================================== */"
+                      );
+
+                      if (result.decompileCompleted()) {
+                          writer.println(
+                              result.getDecompiledFunction()
+                                    .getC()
+                          );
+                      } else {
+                          writer.println(
+                              "/* Decompilation failed */"
+                          );
+                      }
+
+                      writer.println();
+                  }
+
+                  writer.close();
+                  decompiler.dispose();
+              }
+          }
+          EOF
+
+          cp ExportC.java "$GHIDRA_DIR/scripts/"
+
+          "$GHIDRA_DIR/support/analyzeHeadless" \
+            "$(pwd)/ghidra-project" \
+            ELFProject \
+            -process library.so \
+            -scriptPath "$GHIDRA_DIR/scripts" \
+            -postScript ExportC.java "$(pwd)/output/pseudocode.c"
+
+      - name: Save pseudocode
+        uses: actions/upload-artifact@v4
+        with:
+          name: decompiled-c-pseudocode
+          path: output/pseudocode.c
