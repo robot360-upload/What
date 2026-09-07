@@ -11,11 +11,33 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Download Ghidra
+      - name: Install Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Download latest Ghidra
         run: |
-          wget -q https://github.com/NationalSecurityAgency/ghidra/releases/download/Ghidra_12.0_build/ghidra_12.0_PUBLIC_20260306.zip
-          unzip -q ghidra_12.0_PUBLIC_20260306.zip
-          GHIDRA_DIR=$(find . -maxdepth 1 -type d -name 'ghidra_*' | head -1)
+          GHIDRA_URL=$(curl -fsSL \
+            https://api.github.com/repos/NationalSecurityAgency/ghidra/releases/latest \
+            | jq -r '.assets[] | select(.name | endswith(".zip")) | .browser_download_url' \
+            | head -n 1)
+
+          echo "Ghidra URL:"
+          echo "$GHIDRA_URL"
+
+          wget -q --show-progress "$GHIDRA_URL" -O ghidra.zip
+
+          unzip -q ghidra.zip
+
+          GHIDRA_DIR=$(find . -maxdepth 1 -type d -name 'ghidra_*' | head -n 1)
+
+          if [ -z "$GHIDRA_DIR" ]; then
+            echo "Could not find Ghidra directory"
+            exit 1
+          fi
+
           echo "GHIDRA_DIR=$GHIDRA_DIR" >> "$GITHUB_ENV"
 
       - name: Check ELF
@@ -35,23 +57,31 @@ jobs:
             -analysisTimeoutPerFile 600 \
             -deleteProject
 
-      - name: Export C pseudocode
+      - name: Create C pseudocode exporter
         run: |
-          cat > ExportC.java <<'EOF'
-          import ghidra.app.decompiler.*;
-          import ghidra.program.model.listing.*;
-          import ghidra.util.task.*;
+          mkdir -p scripts
+
+          cat > scripts/ExportC.java <<'EOF'
+          import ghidra.app.decompiler.DecompInterface;
+          import ghidra.app.decompiler.DecompileResults;
           import ghidra.app.script.GhidraScript;
+          import ghidra.program.model.listing.Function;
+          import ghidra.program.model.listing.FunctionIterator;
 
           public class ExportC extends GhidraScript {
+
               @Override
               public void run() throws Exception {
-                  DecompInterface decompiler = new DecompInterface();
+
+                  DecompInterface decompiler =
+                      new DecompInterface();
 
                   decompiler.openProgram(currentProgram);
 
                   FunctionIterator functions =
-                      currentProgram.getFunctionManager().getFunctions(true);
+                      currentProgram
+                          .getFunctionManager()
+                          .getFunctions(true);
 
                   java.io.File out =
                       new java.io.File(getScriptArgs()[0]);
@@ -59,15 +89,11 @@ jobs:
                   java.io.PrintWriter writer =
                       new java.io.PrintWriter(out);
 
-                  while (functions.hasNext() && !monitor.isCancelled()) {
-                      Function function = functions.next();
+                  while (functions.hasNext()
+                         && !monitor.isCancelled()) {
 
-                      DecompileResults result =
-                          decompiler.decompileFunction(
-                              function,
-                              60,
-                              monitor
-                          );
+                      Function function =
+                          functions.next();
 
                       writer.println(
                           "/* ======================================== */"
@@ -78,15 +104,32 @@ jobs:
                       );
 
                       writer.println(
+                          "/* Address: "
+                          + function.getEntryPoint()
+                          + " */"
+                      );
+
+                      writer.println(
                           "/* ======================================== */"
                       );
 
-                      if (result.decompileCompleted()) {
-                          writer.println(
-                              result.getDecompiledFunction()
-                                    .getC()
+                      DecompileResults result =
+                          decompiler.decompileFunction(
+                              function,
+                              60,
+                              monitor
                           );
+
+                      if (result.decompileCompleted()) {
+
+                          writer.println(
+                              result
+                                  .getDecompiledFunction()
+                                  .getC()
+                          );
+
                       } else {
+
                           writer.println(
                               "/* Decompilation failed */"
                           );
@@ -101,17 +144,19 @@ jobs:
           }
           EOF
 
-          cp ExportC.java "$GHIDRA_DIR/scripts/"
-
+      - name: Export C pseudocode
+        run: |
           "$GHIDRA_DIR/support/analyzeHeadless" \
             "$(pwd)/ghidra-project" \
             ELFProject \
             -process library.so \
-            -scriptPath "$GHIDRA_DIR/scripts" \
-            -postScript ExportC.java "$(pwd)/output/pseudocode.c"
+            -scriptPath "$(pwd)/scripts" \
+            -postScript ExportC.java \
+            "$(pwd)/output/pseudocode.c"
 
-      - name: Save pseudocode
+      - name: Upload results
         uses: actions/upload-artifact@v4
         with:
-          name: decompiled-c-pseudocode
-          path: output/pseudocode.c
+          name: decompiled-elf
+          path: |
+            output/pseudocode.c
