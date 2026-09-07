@@ -11,55 +11,96 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install Java
+      - name: Install Java 21
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '21'
 
       - name: Download latest Ghidra
+        shell: bash
         run: |
+          set -e
+
+          echo "Finding latest Ghidra release..."
+
           GHIDRA_URL=$(curl -fsSL \
             https://api.github.com/repos/NationalSecurityAgency/ghidra/releases/latest \
-            | jq -r '.assets[] | select(.name | endswith(".zip")) | .browser_download_url' \
+            | jq -r '
+                .assets[]
+                | select(.name | endswith(".zip"))
+                | .browser_download_url
+              ' \
             | head -n 1)
 
-          echo "Ghidra URL:"
+          if [ -z "$GHIDRA_URL" ] || [ "$GHIDRA_URL" = "null" ]; then
+            echo "ERROR: Could not find Ghidra ZIP."
+            exit 1
+          fi
+
+          echo "Downloading:"
           echo "$GHIDRA_URL"
 
-          wget -q --show-progress "$GHIDRA_URL" -O ghidra.zip
+          wget -q --show-progress \
+            "$GHIDRA_URL" \
+            -O ghidra.zip
+
+          echo "Extracting Ghidra..."
 
           unzip -q ghidra.zip
 
-          GHIDRA_DIR=$(find . -maxdepth 1 -type d -name 'ghidra_*' | head -n 1)
+          GHIDRA_DIR=$(find "$GITHUB_WORKSPACE" \
+            -maxdepth 1 \
+            -type d \
+            -name 'ghidra_*_PUBLIC' \
+            | head -n 1)
 
           if [ -z "$GHIDRA_DIR" ]; then
-            echo "Could not find Ghidra directory"
+            echo "ERROR: Ghidra directory was not found."
+            ls -la
             exit 1
           fi
+
+          echo "Ghidra directory:"
+          echo "$GHIDRA_DIR"
 
           echo "GHIDRA_DIR=$GHIDRA_DIR" >> "$GITHUB_ENV"
 
       - name: Check ELF
+        shell: bash
         run: |
+          set -e
+
+          if [ ! -f library.so ]; then
+            echo "ERROR: library.so was not found."
+            echo "Files in repository:"
+            find . -maxdepth 2 -type f
+            exit 1
+          fi
+
+          echo "===== ELF information ====="
+
           file library.so
+
+          echo
+          echo "===== ELF Header ====="
+
           readelf -h library.so
 
-      - name: Create Ghidra project
-        run: |
-          mkdir -p ghidra-project
-          mkdir -p output
+          echo
+          echo "===== Architecture ====="
 
-          "$GHIDRA_DIR/support/analyzeHeadless" \
-            "$(pwd)/ghidra-project" \
-            ELFProject \
-            -import "$(pwd)/library.so" \
-            -analysisTimeoutPerFile 600 \
-            -deleteProject
+          readelf -h library.so | grep -E \
+            'Class:|Data:|Machine:|Type:'
 
-      - name: Create C pseudocode exporter
+      - name: Create Ghidra export script
+        shell: bash
         run: |
+          set -e
+
           mkdir -p scripts
+          mkdir -p output
+          mkdir -p ghidra-project
 
           cat > scripts/ExportC.java <<'EOF'
           import ghidra.app.decompiler.DecompInterface;
@@ -73,34 +114,61 @@ jobs:
               @Override
               public void run() throws Exception {
 
+                  String[] args = getScriptArgs();
+
+                  if (args.length < 1) {
+                      println("ERROR: Output file not specified.");
+                      return;
+                  }
+
+                  String outputPath = args[0];
+
+                  println("========================================");
+                  println("Starting C pseudocode export");
+                  println("Output: " + outputPath);
+                  println("========================================");
+
                   DecompInterface decompiler =
                       new DecompInterface();
 
                   decompiler.openProgram(currentProgram);
+
+                  java.io.PrintWriter writer =
+                      new java.io.PrintWriter(
+                          new java.io.File(outputPath)
+                      );
 
                   FunctionIterator functions =
                       currentProgram
                           .getFunctionManager()
                           .getFunctions(true);
 
-                  java.io.File out =
-                      new java.io.File(getScriptArgs()[0]);
-
-                  java.io.PrintWriter writer =
-                      new java.io.PrintWriter(out);
+                  int total = 0;
+                  int successful = 0;
+                  int failed = 0;
 
                   while (functions.hasNext()
                          && !monitor.isCancelled()) {
 
-                      Function function =
-                          functions.next();
+                      Function function = functions.next();
+
+                      total++;
+
+                      println(
+                          "[" + total + "] Decompiling: "
+                          + function.getName()
+                          + " @ "
+                          + function.getEntryPoint()
+                      );
 
                       writer.println(
                           "/* ======================================== */"
                       );
 
                       writer.println(
-                          "/* " + function.getName() + " */"
+                          "/* Function: "
+                          + function.getName()
+                          + " */"
                       );
 
                       writer.println(
@@ -116,11 +184,12 @@ jobs:
                       DecompileResults result =
                           decompiler.decompileFunction(
                               function,
-                              60,
+                              120,
                               monitor
                           );
 
-                      if (result.decompileCompleted()) {
+                      if (result.decompileCompleted()
+                          && result.getDecompiledFunction() != null) {
 
                           writer.println(
                               result
@@ -128,35 +197,102 @@ jobs:
                                   .getC()
                           );
 
+                          successful++;
+
                       } else {
 
                           writer.println(
                               "/* Decompilation failed */"
                           );
+
+                          failed++;
                       }
 
                       writer.println();
+                      writer.flush();
                   }
 
                   writer.close();
+
                   decompiler.dispose();
+
+                  println("========================================");
+                  println("Decompilation finished");
+                  println("Functions found: " + total);
+                  println("Successful: " + successful);
+                  println("Failed: " + failed);
+                  println("Output: " + outputPath);
+                  println("========================================");
               }
           }
           EOF
 
-      - name: Export C pseudocode
+      - name: Analyze ELF and export C pseudocode
+        shell: bash
         run: |
-          "$GHIDRA_DIR/support/analyzeHeadless" \
-            "$(pwd)/ghidra-project" \
-            ELFProject \
-            -process library.so \
-            -scriptPath "$(pwd)/scripts" \
-            -postScript ExportC.java \
-            "$(pwd)/output/pseudocode.c"
+          set -e
 
-      - name: Upload results
+          echo "Starting Ghidra..."
+
+          "$GHIDRA_DIR/support/analyzeHeadless" \
+            "$GITHUB_WORKSPACE/ghidra-project" \
+            ELFProject \
+            -import "$GITHUB_WORKSPACE/library.so" \
+            -scriptPath "$GITHUB_WORKSPACE/scripts" \
+            -postScript ExportC.java \
+            "$GITHUB_WORKSPACE/output/pseudocode.c" \
+            -analysisTimeoutPerFile 1200
+
+      - name: Generate additional ELF information
+        shell: bash
+        run: |
+          set -e
+
+          readelf -h library.so \
+            > output/elf-header.txt
+
+          readelf -S library.so \
+            > output/sections.txt
+
+          readelf -l library.so \
+            > output/program-headers.txt
+
+          readelf -d library.so \
+            > output/dynamic.txt
+
+          readelf -s library.so \
+            > output/symbols.txt
+
+          readelf -r library.so \
+            > output/relocations.txt
+
+          strings -a library.so \
+            > output/strings.txt
+
+          objdump -d library.so \
+            > output/disassembly.txt || true
+
+      - name: Show output information
+        shell: bash
+        run: |
+          echo "===== Output files ====="
+
+          find output -type f -printf '%p %s bytes\n'
+
+          echo
+          echo "===== Pseudocode size ====="
+
+          wc -l output/pseudocode.c
+
+          echo
+          echo "===== First 100 lines ====="
+
+          head -n 100 output/pseudocode.c
+
+      - name: Upload decompilation results
         uses: actions/upload-artifact@v4
         with:
           name: decompiled-elf
-          path: |
-            output/pseudocode.c
+          path: output/
+          if-no-files-found: error
+          retention-days: 7
