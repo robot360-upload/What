@@ -1,298 +1,347 @@
 name: Decompile ELF
-
 on:
   workflow_dispatch:
-
+permissions:
+  contents: read
 jobs:
   decompile:
     runs-on: ubuntu-latest
-
+    timeout-minutes: 60
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-
       - name: Install Java 21
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '21'
-
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y \
+            binutils \
+            file \
+            jq \
+            unzip \
+            wget
       - name: Download latest Ghidra
         shell: bash
         run: |
-          set -e
-
+          set -euo pipefail
           echo "Finding latest Ghidra release..."
-
-          GHIDRA_URL=$(curl -fsSL \
-            https://api.github.com/repos/NationalSecurityAgency/ghidra/releases/latest \
-            | jq -r '
-                .assets[]
-                | select(.name | endswith(".zip"))
-                | .browser_download_url
-              ' \
-            | head -n 1)
-
-          if [ -z "$GHIDRA_URL" ] || [ "$GHIDRA_URL" = "null" ]; then
-            echo "ERROR: Could not find Ghidra ZIP."
-            exit 1
-          fi
-
-          echo "Downloading:"
-          echo "$GHIDRA_URL"
-
-          wget -q --show-progress \
+          RELEASE_JSON=$(curl -fsSL \
+            --retry 3 \
+            https://api.github.com/repos/NationalSecurityAgency/ghidra/releases/latest)
+          GHIDRA_VERSION=$(jq -er '.tag_name' <<< "$RELEASE_JSON")
+          GHIDRA_URL=$(jq -er '
+            [.assets[]
+             | select(.name | test("^ghidra_.*_PUBLIC_.*\\.zip$"))]
+            | if length > 0
+              then .[0].browser_download_url
+              else error("No official Ghidra public ZIP found")
+              end
+          ' <<< "$RELEASE_JSON")
+          GHIDRA_ARCHIVE=$(basename "$GHIDRA_URL")
+          echo "Ghidra version: $GHIDRA_VERSION"
+          echo "Archive: $GHIDRA_ARCHIVE"
+          wget --show-progress \
             "$GHIDRA_URL" \
             -O ghidra.zip
-
           echo "Extracting Ghidra..."
-
           unzip -q ghidra.zip
-
           GHIDRA_DIR=$(find "$GITHUB_WORKSPACE" \
+            -mindepth 1 \
             -maxdepth 1 \
             -type d \
             -name 'ghidra_*_PUBLIC' \
-            | head -n 1)
-
+            -print -quit)
           if [ -z "$GHIDRA_DIR" ]; then
-            echo "ERROR: Ghidra directory was not found."
+            echo "::error::Ghidra directory was not found."
             ls -la
             exit 1
           fi
-
-          echo "Ghidra directory:"
-          echo "$GHIDRA_DIR"
-
+          if [ ! -x "$GHIDRA_DIR/support/analyzeHeadless" ]; then
+            echo "::error::Ghidra analyzeHeadless is missing."
+            exit 1
+          fi
           echo "GHIDRA_DIR=$GHIDRA_DIR" >> "$GITHUB_ENV"
-
+          echo "Ghidra installed at: $GHIDRA_DIR"
       - name: Check ELF
         shell: bash
         run: |
-          set -e
-
-          if [ ! -f library.so ]; then
-            echo "ERROR: library.so was not found."
+          set -euo pipefail
+          ELF_FILE="$GITHUB_WORKSPACE/library.so"
+          mkdir -p output
+          if [ ! -f "$ELF_FILE" ]; then
+            echo "::error::library.so was not found."
             echo "Files in repository:"
-            find . -maxdepth 2 -type f
+            find . -maxdepth 3 -type f
             exit 1
           fi
-
-          echo "===== ELF information ====="
-
-          file library.so
-
+          echo "===== File information ====="
+          file "$ELF_FILE"
           echo
           echo "===== ELF Header ====="
-
-          readelf -h library.so
-
+          readelf -h "$ELF_FILE"
           echo
           echo "===== Architecture ====="
-
-          readelf -h library.so | grep -E \
-            'Class:|Data:|Machine:|Type:'
-
+          readelf -h "$ELF_FILE" |
+            grep -E 'Class:|Data:|Machine:|Type:'
+          if ! readelf -h "$ELF_FILE" >/dev/null 2>&1; then
+            echo "::error::Input is not a valid ELF file."
+            exit 1
+          fi
+          echo "ELF_FILE=$ELF_FILE" >> "$GITHUB_ENV"
       - name: Create Ghidra export script
         shell: bash
         run: |
-          set -e
-
-          mkdir -p scripts
-          mkdir -p output
-          mkdir -p ghidra-project
-
+          set -euo pipefail
+          mkdir -p scripts output ghidra-project
           cat > scripts/ExportC.java <<'EOF'
+          // ExportC.java
+          // Exports Ghidra decompiler output for every discovered function.
           import ghidra.app.decompiler.DecompInterface;
           import ghidra.app.decompiler.DecompileResults;
           import ghidra.app.script.GhidraScript;
           import ghidra.program.model.listing.Function;
           import ghidra.program.model.listing.FunctionIterator;
-
+          import java.io.BufferedWriter;
+          import java.io.FileWriter;
+          import java.io.PrintWriter;
           public class ExportC extends GhidraScript {
-
               @Override
               public void run() throws Exception {
-
                   String[] args = getScriptArgs();
-
                   if (args.length < 1) {
-                      println("ERROR: Output file not specified.");
-                      return;
-                  }
-
-                  String outputPath = args[0];
-
-                  println("========================================");
-                  println("Starting C pseudocode export");
-                  println("Output: " + outputPath);
-                  println("========================================");
-
-                  DecompInterface decompiler =
-                      new DecompInterface();
-
-                  decompiler.openProgram(currentProgram);
-
-                  java.io.PrintWriter writer =
-                      new java.io.PrintWriter(
-                          new java.io.File(outputPath)
+                      throw new IllegalArgumentException(
+                          "Output file path was not specified."
                       );
-
-                  FunctionIterator functions =
-                      currentProgram
-                          .getFunctionManager()
-                          .getFunctions(true);
-
+                  }
+                  String outputPath = args[0];
                   int total = 0;
                   int successful = 0;
                   int failed = 0;
-
-                  while (functions.hasNext()
-                         && !monitor.isCancelled()) {
-
-                      Function function = functions.next();
-
-                      total++;
-
-                      println(
-                          "[" + total + "] Decompiling: "
-                          + function.getName()
-                          + " @ "
-                          + function.getEntryPoint()
-                      );
-
-                      writer.println(
-                          "/* ======================================== */"
-                      );
-
-                      writer.println(
-                          "/* Function: "
-                          + function.getName()
-                          + " */"
-                      );
-
-                      writer.println(
-                          "/* Address: "
-                          + function.getEntryPoint()
-                          + " */"
-                      );
-
-                      writer.println(
-                          "/* ======================================== */"
-                      );
-
-                      DecompileResults result =
-                          decompiler.decompileFunction(
-                              function,
-                              120,
-                              monitor
-                          );
-
-                      if (result.decompileCompleted()
-                          && result.getDecompiledFunction() != null) {
-
-                          writer.println(
-                              result
-                                  .getDecompiledFunction()
-                                  .getC()
-                          );
-
-                          successful++;
-
-                      } else {
-
-                          writer.println(
-                              "/* Decompilation failed */"
-                          );
-
-                          failed++;
-                      }
-
-                      writer.println();
-                      writer.flush();
-                  }
-
-                  writer.close();
-
-                  decompiler.dispose();
-
                   println("========================================");
-                  println("Decompilation finished");
-                  println("Functions found: " + total);
-                  println("Successful: " + successful);
-                  println("Failed: " + failed);
+                  println("Starting C pseudocode export");
+                  println("Program: " + currentProgram.getName());
                   println("Output: " + outputPath);
                   println("========================================");
+                  DecompInterface decompiler =
+                      new DecompInterface();
+                  try {
+                      if (!decompiler.openProgram(currentProgram)) {
+                          throw new IllegalStateException(
+                              "Failed to initialize Ghidra decompiler."
+                          );
+                      }
+                      try (
+                          PrintWriter writer = new PrintWriter(
+                              new BufferedWriter(
+                                  new FileWriter(outputPath)
+                              )
+                          )
+                      ) {
+                          FunctionIterator functions =
+                              currentProgram
+                                  .getFunctionManager()
+                                  .getFunctions(true);
+                          while (functions.hasNext()
+                                 && !monitor.isCancelled()) {
+                              Function function = functions.next();
+                              total++;
+                              println(
+                                  "[" + total + "] Decompiling: "
+                                  + function.getName()
+                                  + " @ "
+                                  + function.getEntryPoint()
+                              );
+                              writer.println(
+                                  "/* ======================================== */"
+                              );
+                              writer.println(
+                                  "/* Function: "
+                                  + function.getName()
+                                  + " */"
+                              );
+                              writer.println(
+                                  "/* Address: "
+                                  + function.getEntryPoint()
+                                  + " */"
+                              );
+                              writer.println(
+                                  "/* ======================================== */"
+                              );
+                              try {
+                                  DecompileResults result =
+                                      decompiler.decompileFunction(
+                                          function,
+                                          120,
+                                          monitor
+                                      );
+                                  if (result.decompileCompleted()
+                                      && result.getDecompiledFunction() != null) {
+                                      writer.println(
+                                          result
+                                              .getDecompiledFunction()
+                                              .getC()
+                                      );
+                                      successful++;
+                                  } else {
+                                      String error =
+                                          result.getErrorMessage();
+                                      writer.println(
+                                          "/* Decompilation failed: "
+                                          + (error == null
+                                              ? "Unknown error"
+                                              : error.replace("*/", "* /"))
+                                          + " */"
+                                      );
+                                      failed++;
+                                      println(
+                                          "WARNING: Failed to decompile "
+                                          + function.getName()
+                                          + ": " + error
+                                      );
+                                  }
+                              } catch (Exception e) {
+                                  writer.println(
+                                      "/* Decompilation exception: "
+                                      + e.getClass().getSimpleName()
+                                      + " */"
+                                  );
+                                  failed++;
+                                  println(
+                                      "WARNING: Exception while decompiling "
+                                      + function.getName()
+                                      + ": " + e.getMessage()
+                                  );
+                              }
+                              writer.println();
+                              writer.flush();
+                          }
+                      }
+                  } finally {
+                      decompiler.dispose();
+                  }
+                  println("========================================");
+                  println("Decompilation finished");
+                  println("Functions processed: " + total);
+                  println("Successful: " + successful);
+                  println("Failed: " + failed);
+                  println("Cancelled: " + monitor.isCancelled());
+                  println("Output: " + outputPath);
+                  println("========================================");
+                  if (monitor.isCancelled()) {
+                      println(
+                          "WARNING: Analysis was cancelled before completion."
+                      );
+                  }
               }
           }
           EOF
-
       - name: Analyze ELF and export C pseudocode
         shell: bash
         run: |
-          set -e
-
-          echo "Starting Ghidra..."
-
+          set -uo pipefail
+          mkdir -p output ghidra-project
+          echo "Starting Ghidra headless analysis..."
           "$GHIDRA_DIR/support/analyzeHeadless" \
             "$GITHUB_WORKSPACE/ghidra-project" \
             ELFProject \
-            -import "$GITHUB_WORKSPACE/library.so" \
+            -import "$ELF_FILE" \
             -scriptPath "$GITHUB_WORKSPACE/scripts" \
             -postScript ExportC.java \
-            "$GITHUB_WORKSPACE/output/pseudocode.c" \
-            -analysisTimeoutPerFile 1200
-
+              "$GITHUB_WORKSPACE/output/pseudocode.c" \
+            -analysisTimeoutPerFile 1200 \
+            2>&1 | tee "$GITHUB_WORKSPACE/output/ghidra.log"
       - name: Generate additional ELF information
+        if: always()
         shell: bash
         run: |
-          set -e
-
-          readelf -h library.so \
-            > output/elf-header.txt
-
-          readelf -S library.so \
-            > output/sections.txt
-
-          readelf -l library.so \
-            > output/program-headers.txt
-
-          readelf -d library.so \
-            > output/dynamic.txt
-
-          readelf -s library.so \
-            > output/symbols.txt
-
-          readelf -r library.so \
-            > output/relocations.txt
-
-          strings -a library.so \
-            > output/strings.txt
-
-          objdump -d library.so \
-            > output/disassembly.txt || true
-
+          set -uo pipefail
+          mkdir -p output
+          if [ ! -f "${ELF_FILE:-$GITHUB_WORKSPACE/library.so}" ]; then
+            echo "ELF input is missing; skipping metadata extraction."
+            exit 0
+          fi
+          ELF_FILE="${ELF_FILE:-$GITHUB_WORKSPACE/library.so}"
+          run_report() {
+            local report_name="$1"
+            shift
+            echo "Generating $report_name..."
+            if "$@" > "output/$report_name" 2>&1; then
+              echo "Generated $report_name"
+            else
+              local status=$?
+              echo "WARNING: $report_name failed (exit $status)."
+            fi
+          }
+          run_report elf-header.txt \
+            readelf -h "$ELF_FILE"
+          run_report sections.txt \
+            readelf -S "$ELF_FILE"
+          run_report program-headers.txt \
+            readelf -l "$ELF_FILE"
+          run_report dynamic.txt \
+            readelf -d "$ELF_FILE"
+          run_report symbols.txt \
+            readelf -Ws "$ELF_FILE"
+          run_report relocations.txt \
+            readelf -r "$ELF_FILE"
+          run_report strings.txt \
+            strings -a "$ELF_FILE"
+          run_report disassembly.txt \
+            objdump -d "$ELF_FILE"
+          echo "Metadata extraction completed."
+      - name: Generate analysis summary
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output
+          {
+            echo "ELF Decompilation Summary"
+            echo "========================="
+            echo
+            echo "Input: library.so"
+            if [ -f library.so ]; then
+              echo "File size: $(stat -c '%s bytes' library.so)"
+              echo "File type: $(file -b library.so)"
+            fi
+            echo
+            if [ -f output/pseudocode.c ]; then
+              echo "Pseudocode lines: $(wc -l < output/pseudocode.c)"
+              echo "Pseudocode bytes: $(stat -c '%s' output/pseudocode.c)"
+            else
+              echo "Pseudocode: Not generated"
+            fi
+            echo
+            echo "Generated reports:"
+            find output -maxdepth 1 -type f \
+              -printf '%f (%s bytes)\n' |
+              sort
+          } > output/summary.txt
+          cat output/summary.txt
       - name: Show output information
+        if: always()
         shell: bash
         run: |
           echo "===== Output files ====="
-
-          find output -type f -printf '%p %s bytes\n'
-
-          echo
-          echo "===== Pseudocode size ====="
-
-          wc -l output/pseudocode.c
-
-          echo
-          echo "===== First 100 lines ====="
-
-          head -n 100 output/pseudocode.c
-
+          if [ -d output ]; then
+            find output -type f -printf '%p %s bytes\n'
+            if [ -f output/pseudocode.c ]; then
+              echo
+              echo "===== First 100 lines of pseudocode ====="
+              head -n 100 output/pseudocode.c
+            fi
+          fi
       - name: Upload decompilation results
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: decompiled-elf
           path: output/
-          if-no-files-found: error
+          if-no-files-found: warn
           retention-days: 7
